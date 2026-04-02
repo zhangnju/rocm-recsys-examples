@@ -28,6 +28,169 @@ except ImportError:
 from contextlib import contextmanager
 
 
+# ---------------------------------------------------------------------------
+# Architecture detection utilities
+# ---------------------------------------------------------------------------
+
+# Known ROCm architectures that require fbgemm / TBE workarounds.
+# gfx950 (MI355X): fbgemm ops SIGSEGV + TBE deadlock.
+# Extend this set if new architectures exhibit the same issues.
+_ARCHS_NEEDING_FBGEMM_PATCHES: frozenset = frozenset({"gfx950"})
+_ARCHS_NEEDING_TBE_BYPASS:     frozenset = frozenset({"gfx950"})
+
+
+def get_rocm_arch(device: int = 0) -> str:
+    """Return the base GCN arch string for *device* (e.g. 'gfx950', 'gfx942').
+
+    Returns an empty string on non-ROCm platforms or when the arch cannot be
+    determined.
+    """
+    if not torch.version.hip:
+        return ""
+    try:
+        props = torch.cuda.get_device_properties(device)
+        # gcnArchName looks like 'gfx950:sramecc+:xnack-' – take the base part
+        return getattr(props, "gcnArchName", "").split(":")[0].strip()
+    except Exception:
+        return ""
+
+
+def needs_fbgemm_patches(device: int = 0) -> bool:
+    """Return True if fbgemm_gpu ops are known to crash on this GPU."""
+    return get_rocm_arch(device) in _ARCHS_NEEDING_FBGEMM_PATCHES
+
+
+def needs_tbe_bypass(device: int = 0) -> bool:
+    """Return True if TBE (SplitTableBatchedEmbeddingBagsCodegen) deadlocks."""
+    return get_rocm_arch(device) in _ARCHS_NEEDING_TBE_BYPASS
+
+
+# ---------------------------------------------------------------------------
+# fbgemm operator patches
+# ---------------------------------------------------------------------------
+
+def apply_rocm_fbgemm_patches() -> None:
+    """Apply ROCm compatibility patches for fbgemm_gpu operators.
+
+    On certain AMD GPU architectures (currently gfx950 / MI355X), several
+    fbgemm_gpu operators crash with SIGSEGV or deadlock.  We replace them with
+    pure-PyTorch equivalents at runtime.
+
+    For other ROCm architectures (e.g. gfx942 / MI300X) the native fbgemm ops
+    are used unchanged because they work correctly on those GPUs.
+
+    Call this AFTER importing torchrec / fbgemm_gpu.
+    """
+    if not torch.version.hip:
+        return  # NVIDIA CUDA path – nothing to do
+
+    if not hasattr(torch.ops, "fbgemm"):
+        return  # fbgemm_gpu not yet loaded
+
+    arch = get_rocm_arch()
+    if arch and arch not in _ARCHS_NEEDING_FBGEMM_PATCHES:
+        # This architecture is expected to work fine with native fbgemm ops.
+        return
+
+    def _safe_complete_cumsum(lengths: torch.Tensor) -> torch.Tensor:
+        """Complete cumsum: [0, l0, l0+l1, ...], length n+1."""
+        zeros = lengths.new_zeros(1)
+        return torch.cat([zeros, torch.cumsum(lengths, dim=0)])
+
+    def _safe_inclusive_cumsum(lengths: torch.Tensor) -> torch.Tensor:
+        """Inclusive cumsum: [l0, l0+l1, ...], length n."""
+        return torch.cumsum(lengths, dim=0)
+
+    def _safe_exclusive_cumsum(lengths: torch.Tensor) -> torch.Tensor:
+        """Exclusive cumsum: [0, l0, l0+l1, ...], length n (drops last)."""
+        return torch.cat([lengths.new_zeros(1), torch.cumsum(lengths, dim=0)[:-1]])
+
+    def _safe_jagged_to_padded_dense(
+        values: torch.Tensor,
+        offsets: list,
+        max_lengths: list,
+        padding_value: float = 0.0,
+    ) -> torch.Tensor:
+        """Convert jagged tensor to padded dense tensor."""
+        off = offsets[0]  # 1D offsets tensor
+        B = off.numel() - 1
+        max_len = max_lengths[0] if max_lengths else int((off[-1]).item())
+        D = values.shape[1] if values.dim() > 1 else 1
+        if values.dim() == 1:
+            out = values.new_full((B, max_len), padding_value)
+            for i in range(B):
+                s, e = off[i].item(), off[i + 1].item()
+                l = min(e - s, max_len)
+                out[i, :l] = values[s:s+l]
+        else:
+            out = values.new_full((B, max_len, D), padding_value)
+            for i in range(B):
+                s, e = off[i].item(), off[i + 1].item()
+                l = min(e - s, max_len)
+                out[i, :l] = values[s:s+l]
+        return out
+
+    def _safe_dense_to_jagged(
+        dense: torch.Tensor,
+        offsets: list,
+        total_L: int = -1,
+    ):
+        """Convert padded dense tensor to jagged tensor.
+        Returns a tuple (values, lengths) matching fbgemm's API.
+        dense: [B, S] or [B, S, D]
+        offsets: list of 1 tensor of shape [B+1]
+        """
+        off = offsets[0]
+        B = off.numel() - 1
+        if total_L < 0:
+            total_L = int(off[-1].item())
+
+        lengths = off[1:] - off[:-1]
+
+        if dense.dim() == 3:
+            D = dense.shape[2]
+            out = dense.new_zeros((total_L, D))
+            for i in range(B):
+                s, e = off[i].item(), off[i + 1].item()
+                l = e - s
+                out[s:e] = dense[i, :l]
+        elif dense.dim() == 2:
+            out = dense.new_zeros((total_L,))
+            for i in range(B):
+                s, e = off[i].item(), off[i + 1].item()
+                l = e - s
+                out[s:e] = dense[i, :l]
+        else:
+            out = dense.new_zeros((total_L,))
+        return (out, lengths)
+
+    # Apply patches for all operators known to crash on this architecture.
+    import logging
+    logging.getLogger(__name__).info(
+        "[ROCm] Applying fbgemm operator patches for arch=%s", arch or "unknown"
+    )
+    patch_map = {
+        "asynchronous_complete_cumsum": _safe_complete_cumsum,
+        "asynchronous_inclusive_cumsum": _safe_inclusive_cumsum,
+        "asynchronous_exclusive_cumsum": _safe_exclusive_cumsum,
+        "jagged_to_padded_dense": _safe_jagged_to_padded_dense,
+        "dense_to_jagged": _safe_dense_to_jagged,
+    }
+    for op_name, impl in patch_map.items():
+        try:
+            if hasattr(torch.ops.fbgemm, op_name):
+                setattr(torch.ops.fbgemm, op_name, impl)
+        except Exception:
+            pass
+
+    # Patch torchrec's internal _to_offsets which calls asynchronous_complete_cumsum
+    try:
+        import torchrec.sparse.jagged_tensor as jt_module
+        jt_module._to_offsets = _safe_complete_cumsum
+    except Exception:
+        pass
+
+
 def initialize_single_rank():
     if torch.distributed.is_initialized():
         return
@@ -50,6 +213,8 @@ def initialize_distributed():
     backend = "nccl"
     torch.cuda.set_device(device)
     torch.distributed.init_process_group(backend=backend)
+    # Apply ROCm patches after all imports and before any fbgemm ops are called
+    apply_rocm_fbgemm_patches()
 
 
 def initialize_model_parallel(tensor_model_parallel_size=1):

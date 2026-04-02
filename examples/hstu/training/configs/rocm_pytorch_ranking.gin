@@ -1,0 +1,7 @@
+# ROCm/MI355X smoke-test config using pure PyTorch attention (no Triton for attention).
+# Use this to verify the training pipeline works without Triton.
+
+include 'examples/hstu/training/configs/rocm_smoke_ranking.gin'
+
+# Override: use pure PyTorch attention backend
+NetworkArgs.kernel_backend = 'pytorch'

@@ -17,16 +17,20 @@
 #ifndef VEC_DTYPES_CUH_
 #define VEC_DTYPES_CUH_
 
+/* Unified CUDA/HIP header resolution */
+#include "hip_compat.h"
+
+#ifndef __HIP_PLATFORM_AMD__
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-
-#include <type_traits>
-
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
 #define HW_FP8_CONVERSION_ENABLED
 #endif
+#endif /* !__HIP_PLATFORM_AMD__ */
+
+#include <type_traits>
 
 #define INLINE inline __attribute__((always_inline)) __device__
 

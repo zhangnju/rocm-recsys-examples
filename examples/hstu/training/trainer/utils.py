@@ -28,7 +28,12 @@ from configs import (
     PositionEncodingConfig,
     get_hstu_config,
 )
-from dynamicemb import DynamicEmbTableOptions
+try:
+    from dynamicemb import DynamicEmbTableOptions
+    _DYNAMICEMB_AVAILABLE = True
+except ModuleNotFoundError:
+    DynamicEmbTableOptions = None  # type: ignore[assignment,misc]
+    _DYNAMICEMB_AVAILABLE = False
 from utils import (
     BenchmarkDatasetArgs,
     DatasetArgs,

@@ -19,10 +19,17 @@
 ******************************************************************************/
 
 #include <cstdint>
+#include <iostream>
+/* Unified CUDA/HIP compatibility */
+#include "hip_compat.h"
+#ifndef __HIP_PLATFORM_AMD__
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <driver_types.h>
-#include <iostream>
+#else
+using nv_bfloat16 = hip_bfloat16;
+using nv_half     = __half;
+#endif
 #include "vec_dtypes.cuh"
 
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)       \
@@ -87,12 +94,13 @@ void get_uint_fastdiv_msa(uint32_t d, uint32_t &m, uint32_t &s, uint32_t &a) {
 }
 
 __host__ __device__ __forceinline__ void divmod(uint32_t n, uint32_t d,
-                                                uint32_t m, uint32_t s, uint32_t a, 
+                                                uint32_t m, uint32_t s, uint32_t a,
                                                 uint32_t& q, uint32_t& r) {
     if (d == 1) {
         q = n;
     } else {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        /* __umulhi is defined for CUDA; on HIP we provide it via hip_compat.h */
         q = __umulhi(m, n);
 #else
         q = (((unsigned long long)((long long)m * (long long)n)) >> 32);

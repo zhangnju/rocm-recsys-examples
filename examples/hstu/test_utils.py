@@ -28,7 +28,10 @@ from commons.optimizer import OptimizerParam
 from commons.utils.distributed_utils import collective_assert
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend
-from dynamicemb import DynamicEmbTableOptions
+try:
+    from dynamicemb import DynamicEmbTableOptions
+except ModuleNotFoundError:
+    DynamicEmbTableOptions = None  # type: ignore[assignment,misc]
 from megatron.core import parallel_state, tensor_parallel
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.jagged_data import JaggedData

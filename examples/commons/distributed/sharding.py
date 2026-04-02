@@ -24,16 +24,26 @@ import torchrec
 from commons.distributed.finalize_model_grads import finalize_model_grads
 from commons.modules.embedding import DataParallelEmbeddingCollection
 from commons.optimizer import OptimizerParam
-from dynamicemb import DynamicEmbTableOptions
-from dynamicemb.get_planner import get_planner
-from dynamicemb.planner import (
-    DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
-)
-from dynamicemb.shard import (
-    DynamicEmbeddingBagCollectionSharder,
-    DynamicEmbeddingCollectionSharder,
-)
-from dynamicemb.utils import TORCHREC_TYPES
+try:
+    from dynamicemb import DynamicEmbTableOptions
+    from dynamicemb.get_planner import get_planner
+    from dynamicemb.planner import (
+        DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
+    )
+    from dynamicemb.shard import (
+        DynamicEmbeddingBagCollectionSharder,
+        DynamicEmbeddingCollectionSharder,
+    )
+    from dynamicemb.utils import TORCHREC_TYPES
+    _DYNAMICEMB_AVAILABLE = True
+except ModuleNotFoundError:
+    DynamicEmbTableOptions = None  # type: ignore[assignment,misc]
+    get_planner = None  # type: ignore[assignment]
+    DynamicEmbeddingShardingPlanner = None  # type: ignore[assignment,misc]
+    DynamicEmbeddingBagCollectionSharder = None  # type: ignore[assignment,misc]
+    DynamicEmbeddingCollectionSharder = None  # type: ignore[assignment,misc]
+    TORCHREC_TYPES = None  # type: ignore[assignment]
+    _DYNAMICEMB_AVAILABLE = False
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from megatron.core import tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -154,6 +164,101 @@ _optimizer_str_to_optim_type = {
 }
 
 
+class _ROCmEmbeddingCollection(torch.nn.Module):
+    """Pure nn.Embedding replacement for EmbeddingCollection.
+    Avoids TBE (SplitTableBatchedEmbeddingBagsCodegen) on architectures where
+    it is known to deadlock (currently gfx950 / MI355X)."""
+    def __init__(self, configs, device):
+        super().__init__()
+        from torchrec.modules.embedding_configs import EmbeddingConfig as TRecEmbCfg
+        self._configs = configs
+        self._feature_to_table = {}
+        for cfg in configs:
+            for feat in cfg.feature_names:
+                self._feature_to_table[feat] = cfg.name
+        self.embeddings = torch.nn.ModuleDict({
+            cfg.name: torch.nn.Embedding(cfg.num_embeddings, cfg.embedding_dim, device=device)
+            for cfg in configs
+        })
+
+    def forward(self, features):
+        from torchrec.sparse.jagged_tensor import JaggedTensor
+        out_dict = {}
+        keys = features.keys()
+        num_features = len(keys)
+        # In a KJT, lengths has shape [B * num_features] and offsets has shape [B * num_features + 1]
+        # where B is the batch size. Feature i spans offsets[i*B : (i+1)*B+1].
+        # Compute B from total lengths / num_features
+        total_lengths = features.lengths()  # shape [B * num_features]
+        B = total_lengths.numel() // num_features if num_features > 0 else 0
+        offsets = features.offsets()  # shape [B * num_features + 1]
+        values = features.values()
+
+        for i, feat_key in enumerate(keys):
+            table_name = self._feature_to_table.get(feat_key)
+            if table_name and table_name in self.embeddings:
+                # Feature i spans samples [i*B : (i+1)*B]
+                feat_start_offset = offsets[i * B].item()
+                feat_end_offset = offsets[(i + 1) * B].item()
+                indices = values[feat_start_offset:feat_end_offset].long()
+                vocab_size = self.embeddings[table_name].num_embeddings
+                indices = indices.clamp(0, vocab_size - 1)
+                emb = self.embeddings[table_name](indices)
+                # lengths for this feature
+                feat_lengths = total_lengths[i * B : (i + 1) * B]
+                out_dict[feat_key] = JaggedTensor(
+                    values=emb,
+                    lengths=feat_lengths,
+                )
+        return out_dict
+
+    def embedding_configs(self):
+        return self._configs
+
+
+def _apply_dmp_rocm_fallback(
+    model: torch.nn.Module,
+    device: torch.device,
+) -> torch.nn.Module:
+    """Materialize meta-device EmbeddingCollection with nn.Embedding.
+    Bypasses TBE (SplitTableBatchedEmbeddingBagsCodegen) on architectures where
+    TBE is known to deadlock (currently gfx950 / MI355X)."""
+    from torchrec.modules.embedding_modules import EmbeddingCollection
+    from commons.modules.embedding import ShardedEmbedding
+
+    # Walk the model tree and replace EmbeddingCollection with ROCm-safe version
+    def replace_ec_modules(parent, prefix=''):
+        for child_name, child_module in list(parent.named_children()):
+            full_name = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child_module, EmbeddingCollection):
+                configs = child_module.embedding_configs()
+                replacement = _ROCmEmbeddingCollection(configs, device)
+                setattr(parent, child_name, replacement)
+            else:
+                replace_ec_modules(child_module, full_name)
+
+    replace_ec_modules(model)
+
+    # Materialize remaining meta-device parameters.
+    # model.to_empty() properly handles moving from meta to real device without copying.
+    # Our _ROCmEmbeddingCollection already has real parameters so to_empty() is a no-op for them.
+    model = model.to_empty(device=device)
+
+    # Initialize parameters that were just materialized from meta (they are uninitialized)
+    def _init_weights(module):
+        from torchrec.modules.embedding_modules import EmbeddingCollection
+        if isinstance(module, _ROCmEmbeddingCollection):
+            return  # already initialized
+        for name, param in module.named_parameters(recurse=False):
+            if param.device == device:
+                with torch.no_grad():
+                    torch.nn.init.normal_(param, std=0.02)
+
+    model.apply(_init_weights)
+
+    return model
+
+
 def apply_dmp(
     model: torch.nn.Module,
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
@@ -162,6 +267,19 @@ def apply_dmp(
     device: torch.device,
     pipeline_type: str = "native",
 ):
+    # On specific ROCm architectures (gfx950 / MI355X), TBE deadlocks.
+    # Use a pure nn.Embedding fallback for those GPUs only.
+    # Other ROCm architectures (e.g. gfx942 / MI300X) use TBE natively.
+    from commons.utils.initialize import needs_tbe_bypass
+    if needs_tbe_bypass(device.index if device.index is not None else 0):
+        import logging
+        logging.getLogger(__name__).info(
+            "[ROCm] TBE bypass active for arch=%s (device=%s)",
+            __import__("commons.utils.initialize", fromlist=["get_rocm_arch"]).get_rocm_arch(),
+            device,
+        )
+        return _apply_dmp_rocm_fallback(model, device)
+
     enable_prefetch_pipeline = pipeline_type == "prefetch"
     assert (
         sparse_optimizer_param.optimizer_str in _optimizer_str_to_optim_type
@@ -184,37 +302,59 @@ def apply_dmp(
     data_parallel_embedding_table_names = []
     data_parallel_embedding_module_names = []
     for k, module in model.named_modules():
-        if type(module) in TORCHREC_TYPES:
+        if TORCHREC_TYPES is not None and type(module) in TORCHREC_TYPES:
             eb_configs.extend(module.embedding_configs())
             if DATA_PARALLEL_EMBEDDING_MODULE_NAME in k:
                 data_parallel_embedding_module_names.append(k)
                 for config in module.embedding_configs():
                     data_parallel_embedding_table_names.append(config.name)
 
-    planner = get_planner(
-        eb_configs,
-        set(data_parallel_embedding_table_names),
-        dynamicemb_options_dict,
-        device,
-        pipeline_type,
-    )
     qcomm_codecs_registry = get_qcomm_codecs_registry(
         qcomms_config=QCommsConfig(
             forward_precision=CommType.FP32,
             backward_precision=CommType.FP32,
         )
     )
-    sharders = [
-        DynamicEmbeddingBagCollectionSharder(
-            qcomm_codecs_registry=qcomm_codecs_registry,
-            fused_params=fused_params,
-        ),
-        DynamicEmbeddingCollectionSharder(
-            qcomm_codecs_registry=qcomm_codecs_registry,
-            use_index_dedup=True,
-            fused_params=fused_params,
-        ),
-    ]
+    if _DYNAMICEMB_AVAILABLE:
+        planner = get_planner(
+            eb_configs,
+            set(data_parallel_embedding_table_names),
+            dynamicemb_options_dict,
+            device,
+            pipeline_type,
+        )
+        sharders = [
+            DynamicEmbeddingBagCollectionSharder(
+                qcomm_codecs_registry=qcomm_codecs_registry,
+                fused_params=fused_params,
+            ),
+            DynamicEmbeddingCollectionSharder(
+                qcomm_codecs_registry=qcomm_codecs_registry,
+                use_index_dedup=True,
+                fused_params=fused_params,
+            ),
+        ]
+    else:
+        # Fallback: use standard TorchRec planner and sharders when dynamicemb is unavailable
+        from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+        from torchrec.distributed.embedding import EmbeddingCollectionSharder
+        from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=dist.get_world_size(pg),
+                compute_device=device.type,
+            ),
+        )
+        sharders = [
+            EmbeddingBagCollectionSharder(
+                qcomm_codecs_registry=qcomm_codecs_registry,
+                fused_params=fused_params,
+            ),
+            EmbeddingCollectionSharder(
+                qcomm_codecs_registry=qcomm_codecs_registry,
+                fused_params=fused_params,
+            ),
+        ]
     plan = planner.collective_plan(model, sharders, pg)
     data_parallel_sharding_plans = []
     for data_parallel_embedding_module_name in data_parallel_embedding_module_names:

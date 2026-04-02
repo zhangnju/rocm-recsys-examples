@@ -12,11 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import paged_kvcache_ops
+try:
+    import paged_kvcache_ops
+    _PAGED_KV_AVAILABLE = True
+except ModuleNotFoundError:
+    paged_kvcache_ops = None  # type: ignore[assignment]
+    _PAGED_KV_AVAILABLE = False
 import torch
 import torch.nn.functional as F
 from configs import InferenceHSTUConfig, KVCacheConfig
-from hstu import hstu_attn_varlen_func
+try:
+    from hstu import hstu_attn_varlen_func
+except (ImportError, ModuleNotFoundError):
+    hstu_attn_varlen_func = None  # type: ignore[assignment]
 from modules.jagged_data import JaggedData
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
 from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd

@@ -128,24 +128,30 @@ def _host_descriptor_pre_hook(nargs):
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     configs = []
     if torch.version.hip:
-        for BLOCK_M in [32, 64, 128]:
-            for BLOCK_N in [32, 64]:
-                for num_stages in [1, 2]:
-                    for num_warps in [4, 8]:
-                        for matrix_instr_nonkdim in [16, 32]:
-                            configs.append(
-                                triton.Config(
-                                    {
-                                        "BLOCK_M": BLOCK_M,
-                                        "BLOCK_N": BLOCK_N,
-                                        "matrix_instr_nonkdim": matrix_instr_nonkdim,
-                                        "waves_per_eu": 0,
-                                        "kpack": 2,
-                                    },
-                                    num_stages=num_stages,
-                                    num_warps=num_warps,
-                                )
-                            )
+        # Reduced set of configs for ROCm / MI300/MI355 to avoid autotuner crashes
+        for BLOCK_M, BLOCK_N, num_stages, num_warps in [
+            (64, 64, 1, 4),
+            (64, 64, 2, 4),
+            (128, 64, 1, 4),
+            (128, 64, 2, 8),
+            (64, 32, 1, 4),
+            (128, 32, 2, 4),
+        ]:
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": BLOCK_M,
+                        "BLOCK_N": BLOCK_N,
+                        # Required constexpr args for _hstu_attn_fwd on all platforms
+                        "USE_TLX": False,
+                        "NUM_BUFFERS": 1,
+                        "NUM_MMA_WARPS_PER_GROUP": 1,
+                        "NUM_MMA_GROUPS": 1,
+                    },
+                    num_stages=num_stages,
+                    num_warps=num_warps,
+                )
+            )
     else:
         configs = [
             triton.Config(
@@ -2161,29 +2167,29 @@ def _bwd_pre_hook(nargs):
 
 def _get_bw_configs() -> List[triton.Config]:
     if torch.version.hip:
+        # Reduced set of configs for ROCm to avoid autotuner crashes
         configs = []
-        for BLOCK_M in [32, 64]:
-            for BLOCK_N in [32, 64, 128]:
-                for num_stages in [1, 2]:
-                    for num_warps in [4, 8]:
-                        for matrix_instr_nonkdim in [16, 32]:
-                            for waves_per_eu in [0, 2, 4]:
-                                for sp in [True, False]:
-                                    configs.append(
-                                        triton.Config(
-                                            {
-                                                "BLOCK_M": BLOCK_M,
-                                                "BLOCK_N": BLOCK_N,
-                                                "matrix_instr_nonkdim": matrix_instr_nonkdim,
-                                                "waves_per_eu": waves_per_eu,
-                                                "SEQUENCE_PARALLEL": sp,
-                                                "UNROLL": 1,
-                                            },
-                                            num_stages=num_stages,
-                                            num_warps=num_warps,
-                                            pre_hook=_bwd_pre_hook,
-                                        )
-                                    )
+        for BLOCK_M, BLOCK_N, num_stages, num_warps, sp in [
+            (64, 64, 1, 4, False),
+            (64, 64, 2, 4, False),
+            (64, 64, 1, 4, True),
+            (32, 64, 2, 4, False),
+            (64, 32, 1, 4, False),
+            (64, 128, 2, 8, False),
+        ]:
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": BLOCK_M,
+                        "BLOCK_N": BLOCK_N,
+                        "SEQUENCE_PARALLEL": sp,
+                        "UNROLL": 1,
+                    },
+                    num_stages=num_stages,
+                    num_warps=num_warps,
+                    pre_hook=_bwd_pre_hook,
+                )
+            )
         return configs
 
     configs = [

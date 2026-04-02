@@ -21,13 +21,22 @@ from typing import Dict, List, Optional
 
 import torch
 from configs import EmbeddingBackend, InferenceEmbeddingConfig
-from dynamicemb import (
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
-    DynamicEmbPoolingMode,
-    DynamicEmbTableOptions,
-)
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+try:
+    from dynamicemb import (
+        DynamicEmbInitializerArgs,
+        DynamicEmbInitializerMode,
+        DynamicEmbPoolingMode,
+        DynamicEmbTableOptions,
+    )
+    from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+    _DYNAMICEMB_AVAILABLE = True
+except ModuleNotFoundError:
+    DynamicEmbInitializerArgs = None  # type: ignore[assignment,misc]
+    DynamicEmbInitializerMode = None  # type: ignore[assignment,misc]
+    DynamicEmbPoolingMode = None  # type: ignore[assignment,misc]
+    DynamicEmbTableOptions = None  # type: ignore[assignment,misc]
+    BatchedDynamicEmbeddingTablesV2 = None  # type: ignore[assignment,misc]
+    _DYNAMICEMB_AVAILABLE = False
 from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor

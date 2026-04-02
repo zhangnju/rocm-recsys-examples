@@ -18,7 +18,12 @@ from typing import Optional, Union
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import KernelBackend
-from hstu import hstu_attn_varlen_func
+try:
+    from hstu import hstu_attn_varlen_func
+    _HSTU_CUTLASS_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    hstu_attn_varlen_func = None  # type: ignore[assignment]
+    _HSTU_CUTLASS_AVAILABLE = False
 
 
 class HSTUAttention(torch.nn.Module):

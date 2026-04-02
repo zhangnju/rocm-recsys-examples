@@ -24,9 +24,14 @@ import torch
 import torch.fx
 import torch.nn as nn
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
-from dynamicemb.planner import (
-    DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
-)
+try:
+    from dynamicemb.planner import (
+        DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
+    )
+    _DYNAMICEMB_AVAILABLE = True
+except ModuleNotFoundError:
+    DynamicEmbeddingShardingPlanner = None  # type: ignore[misc,assignment]
+    _DYNAMICEMB_AVAILABLE = False
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.sharding.dp_sequence_sharding import (
@@ -194,30 +199,54 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
             for feature in config.feature_names
         ]
 
-        data_parallel_sharding_infos = create_data_parallel_sharding_infos_by_sharding(
-            data_parallel_embedding_collection,
-            data_parallel_sharding_plan,
-            fused_params,
-        )
-        assert (
-            len(data_parallel_sharding_infos) > 0
-        ), "data_parallel_sharding_infos should not be empty"
-        dp_sharding = DpSequenceEmbeddingSharding(
-            sharding_infos=data_parallel_sharding_infos,
-            env=env,
-            device=device,
-        )
-        self._dp_lookups = [
-            dp_sharding.create_lookup(
-                device=device,
-                fused_params=fused_params,
+        import torch
+        self._rocm_mode = bool(torch.version.hip)
+
+        if self._rocm_mode:
+            # On ROCm/HIP, TBE (SplitTableBatchedEmbeddingBagsCodegen) hangs on
+            # gfx950/MI355X due to GPU kernel compatibility issues.
+            # Use standard nn.Embedding as a fallback.
+            self._rocm_embeddings = torch.nn.ModuleDict()
+            for config in self._embedding_configs:
+                self._rocm_embeddings[config.name] = torch.nn.Embedding(
+                    num_embeddings=config.num_embeddings,
+                    embedding_dim=config.embedding_dim,
+                    device=device,
+                )
+        else:
+            data_parallel_sharding_infos = create_data_parallel_sharding_infos_by_sharding(
+                data_parallel_embedding_collection,
+                data_parallel_sharding_plan,
+                fused_params,
             )
-        ]
+            assert (
+                len(data_parallel_sharding_infos) > 0
+            ), "data_parallel_sharding_infos should not be empty"
+            dp_sharding = DpSequenceEmbeddingSharding(
+                sharding_infos=data_parallel_sharding_infos,
+                env=env,
+                device=device,
+            )
+            self._dp_lookups = [
+                dp_sharding.create_lookup(
+                    device=device,
+                    fused_params=fused_params,
+                )
+            ]
 
         self._env = env
         self._device = device
 
-        self._initialize_torch_state()
+        if self._rocm_mode:
+            # Minimal state initialization for ROCm mode
+            self.embeddings: nn.ModuleDict = nn.Module()
+            self.embedding_weights: Dict[str, torch.Tensor] = {}
+            for config in self._embedding_configs:
+                w = self._rocm_embeddings[config.name].weight
+                self.embedding_weights[config.name] = w
+                setattr(w, "need_tp_allreduce", True)
+        else:
+            self._initialize_torch_state()
         self._has_uninitialized_input_dist: bool = True
 
     def _initialize_torch_state(self) -> None:  # noqa
@@ -294,7 +323,34 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
                     self._features_order_tensor,
                 )
             features = features.split(self._feature_splits)[0]
-        embeddings = self._dp_lookups[0](features).view(-1, self._embedding_dim)
+
+        if self._rocm_mode:
+            # ROCm fallback: use nn.Embedding per table instead of TBE
+            # The KJT has features ordered; we look up embeddings in order.
+            # Each feature's values are at offsets[i]:offsets[i+1].
+            feature_to_table: Dict[str, str] = {}
+            for config in self._embedding_configs:
+                for feat_name in config.feature_names:
+                    feature_to_table[feat_name] = config.name
+
+            all_emb_parts = []
+            offsets = features.offsets()  # length: num_features + 1 (per-feature cumulative)
+            values = features.values()
+            for i, feat_key in enumerate(features.keys()):
+                table_name = feature_to_table.get(feat_key)
+                if table_name and table_name in self._rocm_embeddings:
+                    start = offsets[i].item()
+                    end = offsets[i + 1].item()
+                    indices = values[start:end].long()
+                    emb_out = self._rocm_embeddings[table_name](indices)
+                    all_emb_parts.append(emb_out)
+            if all_emb_parts:
+                embeddings = torch.cat(all_emb_parts, dim=0)
+            else:
+                embeddings = torch.zeros(0, self._embedding_dim, device=self._device)
+        else:
+            embeddings = self._dp_lookups[0](features).view(-1, self._embedding_dim)
+
         kjt = KeyedJaggedTensor(
             values=embeddings,
             keys=features.keys(),

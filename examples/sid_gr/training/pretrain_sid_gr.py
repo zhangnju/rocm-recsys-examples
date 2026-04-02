@@ -99,12 +99,14 @@ def main():
     print_rank_0(
         f"distributed env initialization done. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
     )
+    _dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+    _model_dtype = _dtype_map.get(network_args.dtype_str, torch.bfloat16)
     gpt_config = get_gpt_config(
         network_args.hidden_size,
         network_args.kv_channels,
         network_args.num_attention_heads,
         network_args.num_layers,
-        torch.bfloat16,
+        _model_dtype,
         hidden_dropout=network_args.hidden_dropout,
         tensor_model_parallel_size=tp_args.tensor_model_parallel_size,
         loss_on_history=dataset_args.max_candidate_length == 0,

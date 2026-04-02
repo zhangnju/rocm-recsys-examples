@@ -25,9 +25,12 @@ import torch
 import torchmetrics.classification as classification_metrics
 from commons.ops.collective_ops import grouped_allgatherv_tensor_list
 from commons.utils.nvtx_op import output_nvtx_hook
-from dynamicemb.planner import (
-    DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
-)
+try:
+    from dynamicemb.planner import (
+        DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
+    )
+except ModuleNotFoundError:
+    DynamicEmbeddingShardingPlanner = None  # type: ignore[assignment,misc]
 
 try:
     from megatron.core import parallel_state

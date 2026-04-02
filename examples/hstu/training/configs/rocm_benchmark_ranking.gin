@@ -1,0 +1,8 @@
+# ROCm/MI355X-compatible benchmark config for HSTU ranking.
+# Differences from benchmark_ranking.gin:
+#   - kernel_backend = 'triton'  (cutlass not available on ROCm)
+#   - Reduced scale for quick smoke-test
+include 'examples/hstu/training/configs/benchmark_ranking.gin'
+
+# Override: use Triton backend (cutlass is NVIDIA-only)
+NetworkArgs.kernel_backend = 'triton'

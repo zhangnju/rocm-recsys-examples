@@ -19,8 +19,14 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from commons.utils.logger import print_rank_0
-from dynamicemb.dump_load import DynamicEmbDump as dynamic_emb_save
-from dynamicemb.dump_load import DynamicEmbLoad as dynamic_emb_load
+try:
+    from dynamicemb.dump_load import DynamicEmbDump as dynamic_emb_save
+    from dynamicemb.dump_load import DynamicEmbLoad as dynamic_emb_load
+    _DYNAMICEMB_AVAILABLE = True
+except ModuleNotFoundError:
+    dynamic_emb_save = None  # type: ignore[assignment,misc]
+    dynamic_emb_load = None  # type: ignore[assignment,misc]
+    _DYNAMICEMB_AVAILABLE = False
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.transformer.module import Float16Module

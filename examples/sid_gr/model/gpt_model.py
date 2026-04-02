@@ -23,7 +23,21 @@ from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from configs.gpt_config import BOSMode
 from megatron.core.enums import ModelType
-from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+import torch as _torch
+_use_te_linear = False
+if not _torch.version.hip:
+    # On NVIDIA CUDA, try using TE
+    try:
+        import transformer_engine.pytorch as _te_check  # noqa: F401
+        _use_te_linear = True
+    except (ImportError, RuntimeError):
+        _use_te_linear = False
+
+if _use_te_linear:
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+else:
+    # On ROCm or when TE is not available, use Megatron-Core's native ColumnParallelLinear
+    from megatron.core.tensor_parallel import ColumnParallelLinear as TEColumnParallelLinear  # type: ignore[assignment]
 from megatron.core.models.common.embeddings.relative_pos_embedding import (
     RelativePositionEmbedding,
 )
