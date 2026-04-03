@@ -12,20 +12,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import fbgemm_gpu  # for asynchronous_complete_cumsum
 import torch
+
+try:
+    import fbgemm_gpu  # for asynchronous_complete_cumsum  # noqa: F401
+    _FBGEMM_AVAILABLE = True
+except (ImportError, OSError):
+    _FBGEMM_AVAILABLE = False
+
+
+def _cumsum_complete(t: torch.Tensor) -> torch.Tensor:
+    """Pure-PyTorch fallback: [0, t[0], t[0]+t[1], ...]  with a trailing total."""
+    z = torch.zeros(1, dtype=t.dtype, device=t.device)
+    return torch.cat([z, torch.cumsum(t, dim=0)])
 
 
 def length_to_complete_offsets(length_tensor: torch.Tensor):
-    offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(length_tensor)
-    return offsets
+    if _FBGEMM_AVAILABLE:
+        return torch.ops.fbgemm.asynchronous_complete_cumsum(length_tensor)
+    return _cumsum_complete(length_tensor)
 
 
 def length_to_inclusive_offsets(length_tensor: torch.Tensor):
-    offsets = torch.ops.fbgemm.asynchronous_inclusive_cumsum(length_tensor)
-    return offsets
+    if _FBGEMM_AVAILABLE:
+        return torch.ops.fbgemm.asynchronous_inclusive_cumsum(length_tensor)
+    return torch.cumsum(length_tensor, dim=0)
 
 
 def length_to_exclusive_offsets(length_tensor: torch.Tensor):
-    offsets = torch.ops.fbgemm.asynchronous_exclusive_cumsum(length_tensor)
-    return offsets
+    if _FBGEMM_AVAILABLE:
+        return torch.ops.fbgemm.asynchronous_exclusive_cumsum(length_tensor)
+    z = torch.zeros(1, dtype=length_tensor.dtype, device=length_tensor.device)
+    return torch.cat([z, torch.cumsum(length_tensor, dim=0)[:-1]])

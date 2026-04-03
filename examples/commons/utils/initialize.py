@@ -84,13 +84,20 @@ def apply_rocm_fbgemm_patches() -> None:
     if not torch.version.hip:
         return  # NVIDIA CUDA path – nothing to do
 
-    if not hasattr(torch.ops, "fbgemm"):
-        return  # fbgemm_gpu not yet loaded
-
     arch = get_rocm_arch()
-    if arch and arch not in _ARCHS_NEEDING_FBGEMM_PATCHES:
+    fbgemm_loaded = hasattr(torch.ops, "fbgemm")
+
+    if fbgemm_loaded and arch and arch not in _ARCHS_NEEDING_FBGEMM_PATCHES:
         # This architecture is expected to work fine with native fbgemm ops.
         return
+
+    # If fbgemm is not loaded at all (e.g. .so link error), we still need to
+    # register fallback ops so downstream code doesn't crash.
+    if not fbgemm_loaded:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[ROCm] fbgemm_gpu failed to load; registering pure-PyTorch fallbacks"
+        )
 
     def _safe_complete_cumsum(lengths: torch.Tensor) -> torch.Tensor:
         """Complete cumsum: [0, l0, l0+l1, ...], length n+1."""
@@ -164,7 +171,8 @@ def apply_rocm_fbgemm_patches() -> None:
             out = dense.new_zeros((total_L,))
         return (out, lengths)
 
-    # Apply patches for all operators known to crash on this architecture.
+    # Apply patches for all operators known to crash on this architecture,
+    # or register fallbacks if fbgemm_gpu failed to load entirely.
     import logging
     logging.getLogger(__name__).info(
         "[ROCm] Applying fbgemm operator patches for arch=%s", arch or "unknown"
@@ -176,12 +184,25 @@ def apply_rocm_fbgemm_patches() -> None:
         "jagged_to_padded_dense": _safe_jagged_to_padded_dense,
         "dense_to_jagged": _safe_dense_to_jagged,
     }
-    for op_name, impl in patch_map.items():
+    if not fbgemm_loaded:
+        # fbgemm_gpu couldn't load at all — create a minimal stub namespace so
+        # downstream torch.ops.fbgemm.* calls work via the fallbacks.
+        class _FbgemmStub:
+            pass
+        stub = _FbgemmStub()
+        for op_name, impl in patch_map.items():
+            setattr(stub, op_name, impl)
         try:
-            if hasattr(torch.ops.fbgemm, op_name):
-                setattr(torch.ops.fbgemm, op_name, impl)
+            torch.ops.fbgemm = stub  # type: ignore[assignment]
         except Exception:
             pass
+    else:
+        for op_name, impl in patch_map.items():
+            try:
+                if hasattr(torch.ops.fbgemm, op_name):
+                    setattr(torch.ops.fbgemm, op_name, impl)
+            except Exception:
+                pass
 
     # Patch torchrec's internal _to_offsets which calls asynchronous_complete_cumsum
     try:
