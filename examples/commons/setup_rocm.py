@@ -15,8 +15,12 @@ ROCm: 7.x
 """
 import os
 import subprocess
+import torch
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+# PyTorch lib directory (contains libc10.so, libtorch.so, etc.)
+TORCH_LIB_DIR = os.path.join(os.path.dirname(torch.__file__), "lib")
 
 # ---------------------------------------------------------------------------
 # Compiler flags for HIP/HIPCC via PyTorch's CUDAExtension (which calls hipcc
@@ -78,6 +82,9 @@ setup(
                 "cxx": cxx_flags,
                 "nvcc": hipcc_flags,
             },
+            extra_link_args=[
+                f"-Wl,-rpath,{TORCH_LIB_DIR}",
+            ],
             # Make the local csrc/ directory available so hip_compat.h is found
             include_dirs=[
                 os.path.abspath("ops/cuda_ops/csrc"),
