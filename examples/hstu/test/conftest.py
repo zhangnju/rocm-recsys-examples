@@ -26,6 +26,21 @@ Usage:
 
 import os
 
+import torch
+
+# Apply ROCm fbgemm patches at conftest import time (before any test is collected
+# or run) so that ops like jagged_to_padded_dense don't SIGSEGV on gfx950.
+# IMPORTANT: fbgemm_gpu must be imported FIRST so it registers C++ ops,
+# then we patch them. Later re-imports of fbgemm_gpu are no-ops (Python cache).
+if bool(getattr(torch.version, "hip", False)) and torch.cuda.is_available():
+    try:
+        import fbgemm_gpu as _fbgemm_gpu_preload  # noqa - ensure C++ ops registered first
+        from commons.utils.initialize import apply_rocm_fbgemm_patches, needs_fbgemm_patches
+        if needs_fbgemm_patches():
+            apply_rocm_fbgemm_patches()
+    except Exception:
+        pass
+
 
 def pytest_configure(config):
     """Register custom marker for first parameter only mode."""

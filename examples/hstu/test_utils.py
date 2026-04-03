@@ -571,7 +571,16 @@ def create_model(
         adam_eps=1e-8,
         weight_decay=0.0,  # decay is off for better debugging
     )
-    from dynamicemb import DynamicEmbScoreStrategy
+    try:
+        from dynamicemb import DynamicEmbScoreStrategy
+        _dynamicemb_available = True
+    except ModuleNotFoundError:
+        DynamicEmbScoreStrategy = None  # type: ignore[assignment,misc]
+        _dynamicemb_available = False
+
+    if use_dynamic_emb and not _dynamicemb_available:
+        import pytest
+        pytest.skip("dynamicemb not available (NVIDIA-only)")
 
     model_train, dense_optimizer = make_optimizer_and_shard(
         model_train,

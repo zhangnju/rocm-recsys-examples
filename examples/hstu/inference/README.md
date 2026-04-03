@@ -44,6 +44,19 @@ The dense module is served as one instance per GPU, and the KV cache is not supp
 3. The KVCache manager accepts full user history sequence as input. The removal of cached tokens in sequences is completed within inference forward pass.
 
 
+## ROCm / AMD GPU Support
+
+Inference is **not currently supported** on AMD ROCm GPUs. The blocking dependency is `paged_kvcache_ops`, which is an NVIDIA-only library that depends on `nvcomp` (GPU compression). It is imported unconditionally in `modules/inference_dense_module.py`.
+
+| Component | ROCm Status |
+|-----------|-------------|
+| `inference_gr_ranking.py` | ❌ Requires `paged_kvcache_ops` + real dataset + checkpoint |
+| `benchmark/inference_benchmark.py` | ❌ Requires `paged_kvcache_ops` (via `inference_dense_module`) |
+| `benchmark/paged_hstu_with_kvcache_benchmark.py` | ❌ Requires `paged_kvcache_ops` directly |
+| Triton server | ❌ Not tested on ROCm |
+
+Training on ROCm is supported — see [`../training/README.md`](../training/README.md).
+
 ## How to Setup
 
 1. Install the dependencies for Recsys-Examples.

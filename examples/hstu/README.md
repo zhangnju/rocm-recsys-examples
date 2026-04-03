@@ -37,6 +37,64 @@ The prediction head of the HSTU model employs a MLP network structure, enabling 
 * [HSTU training example](./training/)
 * [HSTU inference example](./inference/)
 
+## ROCm / AMD GPU Support (MI355X / gfx950)
+
+HSTU training has been ported to AMD Instinct MI355X (gfx950, ROCm 7.2). The following sections describe what works and the porting changes made.
+
+### Quick Start (ROCm)
+
+```bash
+cd examples/hstu
+PYTHONPATH=/path/to/repo/examples/hstu:/path/to/repo/examples:/path/to/repo/examples/commons \
+  torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000 \
+  ./training/pretrain_gr_ranking.py --gin-config-file ./training/configs/rocm_ranking.gin
+```
+
+See [`training/configs/rocm_ranking.gin`](./training/configs/rocm_ranking.gin) for the ROCm-specific training config.
+
+### ROCm Code Changes
+
+#### 1. Triton Jagged Ops Fallback (`ops/triton_ops/triton_jagged.py`)
+`concat_2D_jagged_w_prefix` and `split_2D_jagged_w_prefix` Triton kernels fail on the AMD Triton backend (`TritonAMDGPUCanonicalizePointers` PassManager error). Pure PyTorch fallbacks were added to `_Concat2DJaggedFunction` and `_Split2DJaggedFunction` (forward and backward) when `torch.version.hip` is set.
+
+#### 2. fbgemm Cumsum Ops (`commons/ops/length_to_offsets.py`)
+Several `fbgemm_gpu` asynchronous cumsum operators (`asynchronous_complete_cumsum`, etc.) cause SIGSEGV on gfx950. `length_to_offsets.py` now auto-detects gfx950 at import time and uses pure PyTorch `torch.cumsum` instead.
+
+#### 3. HSTU Attention Configs (`ops/triton_ops/triton_hstu_attention.py`)
+ROCm-specific Triton config parameters added (`USE_TLX=False`, `NUM_BUFFERS=1`, etc.). The invalid `causal` kwarg removed from `fused_hstu_op.py` calls.
+
+#### 4. Training Config (`training/configs/rocm_ranking.gin`)
+- `kernel_backend = 'triton'` (not `'cutlass'` — CUTLASS is NVIDIA-only)
+- `pipeline_type = 'none'` (avoids TBE all-to-all which deadlocks on gfx950)
+- `enable_balanced_shuffler = False` (avoids `keyed_jagged_index_select_dim1` SIGSEGV)
+
+### Unit Test Status (ROCm)
+
+Run tests with:
+```bash
+LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH \
+PYTEST_FIRST_PARAM_ONLY=1 \
+  torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000 \
+  -m pytest test/<test_file>.py -k "not CUTLASS"
+```
+
+| Status | Test Files |
+|--------|-----------|
+| ✅ Pass | `test_addmm`, `test_jagged_tensor`, `test_metrics`, `test_ln_silu`, `test_ln_mul_dropout`, `test_triton_silu`, `test_hstu_preprocess`, `test_hstu_op` (excl. CUTLASS), `test_hstu_layer` (excl. CUTLASS), `test_collective`, `test_position_encoder` |
+| ⚠️ Skip (expected) | `test_checkpointing`, `test_pipeline` — requires `dynamicemb` (NVIDIA-only) or `Float16Module` (needs Transformer Engine); `test_embedding` — NVEMB backend is NVIDIA-only; CUTLASS parametrized cases |
+| ❌ Cannot run | `test_kvcache`, `test_paged_*`, `test_hstu_block_inference` — require `paged_kvcache_ops`/nvcomp (NVIDIA-only); `test_batch_balancer` — `keyed_jagged_index_select_dim1` SIGSEGV on gfx950; `test_dataset` — requires real dataset files; `hstu_attn/` — requires `hstu_attn_varlen_func` CUDA binary |
+
+Test infrastructure changes for ROCm:
+- `test/conftest.py` — imports `fbgemm_gpu` first, then applies ROCm patches (order matters)
+- `test_utils.py` — `dynamicemb` import wrapped in try/except with `pytest.skip`
+- `test/test_checkpointing.py` — `test_data_parallel_embedding_collection` skipped on gfx950
+
+### Inference Status (ROCm)
+
+Inference scripts (`inference/`) are **not supported** on ROCm:
+- `inference_dense_module.py` has an unconditional `import paged_kvcache_ops` which depends on `nvcomp` (NVIDIA-only)
+- `inference_gr_ranking.py` additionally requires a real dataset and trained checkpoint
+
 # Acknowledgements
 
 We would like to thank Yueming Wang (yuemingw@meta.com) and Jiaqi Zhai(jiaqiz@meta.com) for their guidance and assistance with the paper Action Speaks Louder Than Words during our efforts to understand the algorithm and reproduce the results. We also extend our gratitude to all the authors of the paper for their contributions and guidance. In addition, we would like to express special thanks to developers of [generative-recommenders](https://github.com/facebookresearch/generative-recommenders) that we have referenced. 

@@ -72,6 +72,45 @@ refer to [MovieLens 1M](https://grouplens.org/datasets/movielens/1m/) and [Movie
  
 refer to [KuaiRand](https://kuairand.com/) for details.
 
+## ROCm / AMD GPU Support
+
+HSTU ranking training is supported on AMD Instinct MI355X (gfx950, ROCm 7.2).
+
+### Environment Setup (ROCm)
+
+```bash
+pip install fbgemm-gpu==1.6.0+rocm7.2.26015 --index-url https://download.pytorch.org/whl/rocm7.2
+pip install torchrec==1.4.0 --no-deps
+pip install megatron-core gin-config rich nvtx torchmetrics==1.0.3 typing-extensions iopath
+# Do NOT install transformer-engine — it breaks the setup on ROCm
+```
+
+Build the HSTU CUDA ops for ROCm (HIP):
+```bash
+cd examples/commons && python setup_rocm.py build_ext --inplace
+```
+
+### ROCm Training Config
+
+Use [`configs/rocm_ranking.gin`](./configs/rocm_ranking.gin) which sets:
+- `kernel_backend = 'triton'` — CUTLASS is NVIDIA-only
+- `pipeline_type = 'none'` — avoids TBE all-to-all (deadlocks on gfx950)
+- `enable_balanced_shuffler = False` — avoids `keyed_jagged_index_select_dim1` SIGSEGV on gfx950
+
+### Run (ROCm)
+
+```bash
+cd examples/hstu
+PYTHONPATH=/path/to/repo/examples/hstu:/path/to/repo/examples:/path/to/repo/examples/commons \
+  torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000 \
+  ./training/pretrain_gr_ranking.py --gin-config-file ./training/configs/rocm_ranking.gin
+```
+
+Expected output on MI355X (~14 TFLOPS):
+```
+[train] [iter 19, tokens 20480, elapsed_time 95ms, achieved FLOPS 14.00 TFLOPS]: loss 2.772920
+```
+
 ## Running the examples
 
 Before getting started, please make sure that all pre-requisites are fulfilled. You can refer to [Get Started](../../../README) section in the root directory of the repo to set up the environment.

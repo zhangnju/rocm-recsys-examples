@@ -173,6 +173,14 @@ from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
+def _is_gfx950() -> bool:
+    import torch
+    if not bool(getattr(torch.version, "hip", False)) or not torch.cuda.is_available():
+        return False
+    return getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").startswith("gfx950")
+
+
+@pytest.mark.skipif(_is_gfx950(), reason="KJT.permute (permute_2D_sparse_data) crashes on gfx950")
 def test_data_parallel_embedding_collection():
     init.initialize_distributed()
     init.initialize_model_parallel(1)

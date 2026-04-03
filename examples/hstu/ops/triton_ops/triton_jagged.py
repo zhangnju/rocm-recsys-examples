@@ -981,14 +981,18 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
             dtype = values_a.dtype
             stride_dense_batch = 0
 
-        BLOCK_D = triton.next_power_of_2(D)
+        # concat_2D_jagged_w_prefix fails AMD Triton backend (TritonAMDGPUCanonicalizePointers).
+        # Fall back to a pure-PyTorch loop on all ROCm builds.
+        _use_triton = not bool(getattr(torch.version, "hip", False))
         if is_replace:
             values_out = torch.empty_like(values_a)
         else:
             values_out = torch.empty(
                 (seq_len_a + seq_len_b, D), device=device, dtype=dtype
             )
-        if n_prefix_from_right == 0:
+        if _use_triton:
+            BLOCK_D = triton.next_power_of_2(D)
+        if _use_triton and n_prefix_from_right == 0:
             concat_2D_jagged[(max_seq_len, B)](
                 OffsetsA=offsets_a,
                 ValuesA=values_a,
@@ -1006,7 +1010,7 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
                 BLOCK_D=BLOCK_D,
                 IS_REPLACE=is_replace,  # pyre-ignore[6]
             )
-        else:
+        elif _use_triton:
             concat_2D_jagged_jagged_w_prefix[(max_seq_len, B)](
                 OffsetsA=offsets_a,
                 ValuesA=values_a,
@@ -1020,6 +1024,40 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
                 n_prefix_from_B=n_prefix_from_right,
                 BLOCK_D=BLOCK_D,
             )
+        else:
+            # Pure PyTorch fallback for ROCm
+            offs_a = offsets_a if not is_dense_a else None
+            offs_b = offsets_b if not is_dense_b else None
+            dst_offset = 0
+            for i in range(B):
+                if is_dense_a:
+                    la = dense_size
+                    a_slice = values_a[i].reshape(dense_size, D)
+                else:
+                    sa = int(offs_a[i].item())
+                    la = int(offs_a[i + 1].item()) - sa
+                    a_slice = values_a[sa:sa + la]
+                if is_dense_b:
+                    lb = dense_size
+                    b_slice = values_b[i].reshape(dense_size, D)
+                else:
+                    sb = int(offs_b[i].item())
+                    lb = int(offs_b[i + 1].item()) - sb
+                    b_slice = values_b[sb:sb + lb]
+                if is_replace:
+                    values_out[dst_offset:dst_offset + la - lb] = a_slice[:la - lb]
+                    values_out[dst_offset + la - lb:dst_offset + la] = b_slice
+                    dst_offset += la
+                elif n_prefix_from_right == 0:
+                    values_out[dst_offset:dst_offset + la] = a_slice
+                    values_out[dst_offset + la:dst_offset + la + lb] = b_slice
+                    dst_offset += la + lb
+                else:
+                    prefix = n_prefix_from_right
+                    values_out[dst_offset:dst_offset + prefix] = b_slice[:prefix]
+                    values_out[dst_offset + prefix:dst_offset + prefix + la] = a_slice
+                    values_out[dst_offset + prefix + la:dst_offset + la + lb] = b_slice[prefix:]
+                    dst_offset += la + lb
         ctx.save_for_backward(offsets_a, offsets_b)
         ctx.max_seq_len = max_seq_len
         ctx.seq_len_a = seq_len_a
@@ -1048,14 +1086,15 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
         else:
             B = offsets_a.shape[0] - 1
         _, D = d_out.shape
-        BLOCK_D = triton.next_power_of_2(D)
         values_a = torch.zeros(
             (ctx.seq_len_a, D), device=d_out.device, dtype=d_out.dtype
         )
         values_b = torch.empty(
             (ctx.seq_len_b, D), device=d_out.device, dtype=d_out.dtype
         )
-        if ctx.n_prefix_from_right == 0:
+        _use_triton_bwd = not bool(getattr(torch.version, "hip", False))
+        if _use_triton_bwd and ctx.n_prefix_from_right == 0:
+            BLOCK_D = triton.next_power_of_2(D)
             split_2D_jagged[(ctx.max_seq_len, B)](
                 JaggedIn=d_out,
                 DenseSize=dense_size,
@@ -1072,7 +1111,8 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
                 IS_DENSE_B=is_dense_b,
                 IS_REPLACE=is_replace,
             )
-        else:
+        elif _use_triton_bwd:
+            BLOCK_D = triton.next_power_of_2(D)
             split_2D_jagged_jagged_w_prefix[(ctx.max_seq_len, B)](
                 JaggedIn=d_out,
                 OffsetsA=offsets_a,
@@ -1086,6 +1126,44 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
                 n_prefix_to_B=ctx.n_prefix_from_right,
                 BLOCK_D=BLOCK_D,
             )
+        else:
+            # Pure PyTorch backward fallback for ROCm
+            offs_a = offsets_a if not is_dense_a else None
+            offs_b = offsets_b if not is_dense_b else None
+            src_offset = 0
+            dst_a_offset = 0
+            dst_b_offset = 0
+            for i in range(B):
+                if is_dense_a:
+                    la = dense_size
+                else:
+                    sa = int(offs_a[i].item())
+                    la = int(offs_a[i + 1].item()) - sa
+                if is_dense_b:
+                    lb = dense_size
+                else:
+                    sb = int(offs_b[i].item())
+                    lb = int(offs_b[i + 1].item()) - sb
+                if is_replace:
+                    values_a[dst_a_offset:dst_a_offset + la - lb] = d_out[src_offset:src_offset + la - lb]
+                    values_b[dst_b_offset:dst_b_offset + lb] = d_out[src_offset + la - lb:src_offset + la]
+                    src_offset += la
+                    dst_a_offset += la
+                    dst_b_offset += lb
+                elif ctx.n_prefix_from_right == 0:
+                    values_a[dst_a_offset:dst_a_offset + la] = d_out[src_offset:src_offset + la]
+                    values_b[dst_b_offset:dst_b_offset + lb] = d_out[src_offset + la:src_offset + la + lb]
+                    src_offset += la + lb
+                    dst_a_offset += la
+                    dst_b_offset += lb
+                else:
+                    prefix = ctx.n_prefix_from_right
+                    values_b[dst_b_offset:dst_b_offset + prefix] = d_out[src_offset:src_offset + prefix]
+                    values_a[dst_a_offset:dst_a_offset + la] = d_out[src_offset + prefix:src_offset + prefix + la]
+                    values_b[dst_b_offset + prefix:dst_b_offset + lb] = d_out[src_offset + prefix + la:src_offset + la + lb]
+                    src_offset += la + lb
+                    dst_a_offset += la
+                    dst_b_offset += lb
 
         if is_dense_a:
             values_a = values_a.reshape((B, dense_size, D))
@@ -1133,10 +1211,14 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             if seq_len_b is None:
                 seq_len_b = int(offsets_b[-1].item())
         _, D = values.shape
-        BLOCK_D = triton.next_power_of_2(D)
         values_a = torch.empty((seq_len_a, D), device=values.device, dtype=values.dtype)
         values_b = torch.empty((seq_len_b, D), device=values.device, dtype=values.dtype)
-        if n_prefix_to_right == 0:
+        # split_2D_jagged_w_prefix fails AMD Triton backend (TritonAMDGPUCanonicalizePointers).
+        # Fall back to a pure-PyTorch loop on all ROCm builds.
+        _use_triton = not bool(getattr(torch.version, "hip", False))
+        if _use_triton:
+            BLOCK_D = triton.next_power_of_2(D)
+        if _use_triton and n_prefix_to_right == 0:
             split_2D_jagged[(max_seq_len, B)](
                 JaggedIn=values,
                 DenseSize=dense_size,
@@ -1153,7 +1235,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                 BLOCK_D=BLOCK_D,
                 IS_REPLACE=False,  # pyre-ignore[6]
             )
-        else:
+        elif _use_triton:
             split_2D_jagged_jagged_w_prefix[(max_seq_len, B)](
                 JaggedIn=values,
                 OffsetsA=offsets_a,
@@ -1167,6 +1249,37 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                 n_prefix_to_B=n_prefix_to_right,
                 BLOCK_D=BLOCK_D,
             )
+        else:
+            # Pure PyTorch fallback for ROCm
+            offs_a = offsets_a if not is_dense_a else None
+            offs_b = offsets_b if not is_dense_b else None
+            src_offset = 0
+            dst_a_offset = 0
+            dst_b_offset = 0
+            for i in range(B):
+                if is_dense_a:
+                    la = dense_size
+                    sa = i * dense_size
+                else:
+                    sa = int(offs_a[i].item())
+                    la = int(offs_a[i + 1].item()) - sa
+                if is_dense_b:
+                    lb = dense_size
+                    sb = i * dense_size
+                else:
+                    sb = int(offs_b[i].item())
+                    lb = int(offs_b[i + 1].item()) - sb
+                if n_prefix_to_right == 0:
+                    values_a[dst_a_offset:dst_a_offset + la] = values[src_offset:src_offset + la]
+                    values_b[dst_b_offset:dst_b_offset + lb] = values[src_offset + la:src_offset + la + lb]
+                else:
+                    prefix = n_prefix_to_right
+                    values_b[dst_b_offset:dst_b_offset + prefix] = values[src_offset:src_offset + prefix]
+                    values_a[dst_a_offset:dst_a_offset + la] = values[src_offset + prefix:src_offset + prefix + la]
+                    values_b[dst_b_offset + prefix:dst_b_offset + lb] = values[src_offset + prefix + la:src_offset + la + lb]
+                src_offset += la + lb
+                dst_a_offset += la
+                dst_b_offset += lb
         if is_dense_a:
             values_a = values_a.reshape(B, dense_size, D)
         if is_dense_b:
@@ -1197,13 +1310,14 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         else:
             stride_dense_batch = 0
 
-        BLOCK_D = triton.next_power_of_2(ctx.D)
         dvalues = torch.empty(
             (ctx.seq_len_a + ctx.seq_len_b, ctx.D),
             device=values_a.device,
             dtype=values_b.dtype,
         )
-        if ctx.n_prefix_to_right == 0:
+        _use_triton_bwd = not bool(getattr(torch.version, "hip", False))
+        if _use_triton_bwd and ctx.n_prefix_to_right == 0:
+            BLOCK_D = triton.next_power_of_2(ctx.D)
             concat_2D_jagged[(ctx.max_seq_len, ctx.B)](
                 OffsetsA=offsets_a,
                 ValuesA=values_a,
@@ -1221,7 +1335,8 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                 BLOCK_D=BLOCK_D,
                 IS_REPLACE=False,  # pyre-ignore[6]
             )
-        else:
+        elif _use_triton_bwd:
+            BLOCK_D = triton.next_power_of_2(ctx.D)
             concat_2D_jagged_jagged_w_prefix[(ctx.max_seq_len, ctx.B)](
                 OffsetsA=offsets_a,
                 ValuesA=values_a,
@@ -1235,6 +1350,37 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                 n_prefix_from_B=ctx.n_prefix_to_right,
                 BLOCK_D=BLOCK_D,
             )
+        else:
+            # Pure PyTorch backward fallback for ROCm
+            offs_a = offsets_a if not is_dense_a else None
+            offs_b = offsets_b if not is_dense_b else None
+            if is_dense_a:
+                values_a = values_a.reshape(-1, ctx.D)
+            if is_dense_b:
+                values_b = values_b.reshape(-1, ctx.D)
+            prefix = ctx.n_prefix_to_right
+            dst_offset = 0
+            src_a_offset = 0
+            src_b_offset = 0
+            for i in range(ctx.B):
+                if is_dense_a:
+                    la = ctx.dense_size
+                else:
+                    la = int(offs_a[i + 1].item()) - int(offs_a[i].item())
+                if is_dense_b:
+                    lb = ctx.dense_size
+                else:
+                    lb = int(offs_b[i + 1].item()) - int(offs_b[i].item())
+                if prefix == 0:
+                    dvalues[dst_offset:dst_offset + la] = values_a[src_a_offset:src_a_offset + la]
+                    dvalues[dst_offset + la:dst_offset + la + lb] = values_b[src_b_offset:src_b_offset + lb]
+                else:
+                    dvalues[dst_offset:dst_offset + prefix] = values_b[src_b_offset:src_b_offset + prefix]
+                    dvalues[dst_offset + prefix:dst_offset + prefix + la] = values_a[src_a_offset:src_a_offset + la]
+                    dvalues[dst_offset + prefix + la:dst_offset + la + lb] = values_b[src_b_offset + prefix:src_b_offset + lb]
+                dst_offset += la + lb
+                src_a_offset += la
+                src_b_offset += lb
 
         return dvalues, None, None, None, None, None, None, None
 
